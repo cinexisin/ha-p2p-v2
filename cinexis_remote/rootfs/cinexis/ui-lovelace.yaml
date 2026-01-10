@@ -1,6 +1,7 @@
 title: Cinexis
 views:
   - title: Home
+    path: home
     icon: mdi:home-automation
     cards:
       - type: markdown
@@ -10,17 +11,51 @@ views:
 
       - type: grid
         columns: 2
+        square: false
         cards:
           - type: button
             name: Lights
             icon: mdi:lightbulb-group
             tap_action:
               action: navigate
-              navigation_path: /lovelace/cinexis/lights
+              navigation_path: /lovelace/cinexis-home/lights
 
           - type: button
             name: Scenes
             icon: mdi:palette
             tap_action:
               action: navigate
-              navigation_path: /lovelace/cinexis/scenes
+              navigation_path: /lovelace/cinexis-home/scenes
+
+          - type: button
+            name: Climate
+            icon: mdi:thermostat
+            tap_action:
+              action: navigate
+              navigation_path: /lovelace/cinexis-home/climate
+
+  - title: Lights
+    path: lights
+    icon: mdi:lightbulb
+    cards:
+      - type: entities
+        title: Lights
+        show_header_toggle: true
+        entities:
+          - group.all_lights
+
+  - title: Scenes
+    path: scenes
+    icon: mdi:palette
+    cards:
+      - type: markdown
+        content: |
+          Add scenes here later (Phase-2 auto-discovery).
+
+  - title: Climate
+    path: climate
+    icon: mdi:thermostat
+    cards:
+      - type: markdown
+        content: |
+          Add climate entities here later (Phase-2 auto-discovery).
