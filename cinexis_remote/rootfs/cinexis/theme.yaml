@@ -1,0 +1,6 @@
+cinexis_orange:
+  primary-color: "#FF6A00"
+  accent-color: "#FF6A00"
+  app-header-background-color: "#FF6A00"
+  app-header-text-color: "#FFFFFF"
+  ha-card-border-radius: "14px"
