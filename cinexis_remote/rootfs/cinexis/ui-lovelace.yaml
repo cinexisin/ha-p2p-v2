@@ -1,0 +1,26 @@
+title: Cinexis
+views:
+  - title: Home
+    icon: mdi:home-automation
+    cards:
+      - type: markdown
+        content: |
+          # Cinexis Smart Home
+          **Site:** {{HOME_LABEL}}
+
+      - type: grid
+        columns: 2
+        cards:
+          - type: button
+            name: Lights
+            icon: mdi:lightbulb-group
+            tap_action:
+              action: navigate
+              navigation_path: /lovelace/cinexis/lights
+
+          - type: button
+            name: Scenes
+            icon: mdi:palette
+            tap_action:
+              action: navigate
+              navigation_path: /lovelace/cinexis/scenes
