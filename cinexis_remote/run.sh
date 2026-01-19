@@ -12,43 +12,39 @@ jq_get() {
   jq -r ".$key // empty" "$CONFIG_PATH"
 }
 
-read_file_trim() {
-  local f="$1"
-  if [[ -f "$f" ]]; then
-    tr -d '\r\n' < "$f"
-  else
-    echo ""
-  fi
-}
-
-write_file_600() {
-  local f="$1"
-  local v="$2"
-  umask 077
-  printf "%s" "$v" > "$f"
-}
+PAIR_API="$(jq_get pair_api)"
+PAIR_CODE="$(jq_get pair_code)"
 
 FRPS_HOST="$(jq_get frps_host)"
 FRPS_PORT="$(jq_get frps_port)"
+
 HA_SCHEME="$(jq_get ha_scheme)"
 HA_HOST="$(jq_get ha_host)"
 HA_PORT="$(jq_get ha_port)"
 
-PAIR_API="$(jq_get pair_api)"
-PAIR_CODE="$(jq_get pair_code)"
+# Defaults
+[[ -n "${FRPS_HOST}" ]] || FRPS_HOST="cinexis.cloud"
+[[ -n "${FRPS_PORT}" ]] || FRPS_PORT="7000"
+[[ -n "${HA_SCHEME}" ]] || HA_SCHEME="http"
+[[ -n "${HA_HOST}" ]] || HA_HOST="127.0.0.1"
+[[ -n "${HA_PORT}" ]] || HA_PORT="8123"
 
-if [[ -z "${FRPS_HOST}" ]]; then FRPS_HOST="cinexis.cloud"; fi
-if [[ -z "${FRPS_PORT}" ]]; then FRPS_PORT="7000"; fi
-if [[ -z "${HA_SCHEME}" ]]; then HA_SCHEME="http"; fi
-if [[ -z "${HA_HOST}" ]]; then HA_HOST="127.0.0.1"; fi
-if [[ -z "${HA_PORT}" ]]; then HA_PORT="8123"; fi
-if [[ -z "${PAIR_API}" ]]; then PAIR_API="https://pair.cinexis.cloud"; fi
+# Load persisted home_id/token if present
+HOME_ID=""
+TOKEN=""
 
-HOME_ID="$(read_file_trim "${HOMEID_FILE}")"
-TOKEN="$(read_file_trim "${TOKEN_FILE}")"
+if [[ -f "${HOMEID_FILE}" ]]; then
+  HOME_ID="$(cat "${HOMEID_FILE}" 2>/dev/null || true)"
+fi
 
-if [[ ( -z "${HOME_ID}" || -z "${TOKEN}" ) && -n "${PAIR_CODE}" ]]; then
+if [[ -f "${TOKEN_FILE}" ]]; then
+  TOKEN="$(cat "${TOKEN_FILE}" 2>/dev/null || true)"
+fi
+
+# Pairing flow (pair_code -> {home_id, token})
+if [[ -n "${PAIR_CODE}" && -n "${PAIR_API}" ]]; then
   echo "[INFO] Pairing with Cinexis Cloud..."
+
   set +e
   RESP="$(curl -fsSL -X POST "${PAIR_API}/pair/confirm" \
     -H "Content-Type: application/json" \
@@ -57,26 +53,31 @@ if [[ ( -z "${HOME_ID}" || -z "${TOKEN}" ) && -n "${PAIR_CODE}" ]]; then
   set -e
 
   if [[ "${CURL_RC}" -ne 0 || -z "${RESP}" ]]; then
-    echo "[WARN] Pairing failed (could not confirm code). Please verify the code and try again."
+    echo "[WARN] Pairing failed (network/HTTP). Continuing with any saved credentials..."
   else
-    NEW_HOME_ID="$(echo "${RESP}" | jq -r '.home_id // empty')"
-    NEW_TOKEN="$(echo "${RESP}" | jq -r '.token // empty')"
+    # Expect: {"home_id":"...","token":"..."}
+    NEW_HOME_ID="$(echo "${RESP}" | jq -r '.home_id // empty' 2>/dev/null || true)"
+    NEW_TOKEN="$(echo "${RESP}" | jq -r '.token // empty' 2>/dev/null || true)"
 
     if [[ -n "${NEW_HOME_ID}" && -n "${NEW_TOKEN}" ]]; then
       HOME_ID="${NEW_HOME_ID}"
       TOKEN="${NEW_TOKEN}"
-      write_file_600 "${HOMEID_FILE}" "${HOME_ID}"
-      write_file_600 "${TOKEN_FILE}" "${TOKEN}"
-      echo "[INFO] Pairing success. HomeID saved."
+      echo -n "${HOME_ID}" > "${HOMEID_FILE}"
+      chmod 600 "${HOMEID_FILE}" || true
+      echo -n "${TOKEN}" > "${TOKEN_FILE}"
+      chmod 600 "${TOKEN_FILE}" || true
+      echo "[INFO] Pairing OK. Saved home_id + token."
     else
-      echo "[WARN] Pairing response missing home_id/token. Response was: ${RESP}"
+      echo "[WARN] Pairing response missing fields. Continuing with any saved credentials..."
     fi
   fi
 fi
 
+# If still no home_id, generate and persist
 if [[ -z "${HOME_ID}" ]]; then
   HOME_ID="$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 20)"
-  write_file_600 "${HOMEID_FILE}" "${HOME_ID}"
+  echo -n "${HOME_ID}" > "${HOMEID_FILE}"
+  chmod 600 "${HOMEID_FILE}" || true
 fi
 
 PUBLIC_URL="https://${HOME_ID}.ha.cinexis.cloud"
@@ -91,12 +92,19 @@ echo " HA Target   : ${HA_TARGET}"
 echo " FRPS        : ${FRPS_HOST}:${FRPS_PORT}"
 echo "========================================"
 
+# Safety checks
 if [[ -z "${TOKEN}" ]]; then
   echo "[ERROR] No token available."
-  echo "        Enter a valid pair_code in the add-on config, then Start the add-on again."
+  echo "        Enter a Pair Code in the add-on config and restart the add-on."
   exit 1
 fi
 
+if [[ ! -x /frpc ]]; then
+  echo "[ERROR] /frpc not found or not executable inside the add-on image."
+  exit 1
+fi
+
+# Write frpc.toml
 cat > "${FRPC_TOML}" <<EOF
 serverAddr = "${FRPS_HOST}"
 serverPort = ${FRPS_PORT}
@@ -111,11 +119,7 @@ localPort = ${HA_PORT}
 customDomains = ["${HOME_ID}.ha.cinexis.cloud"]
 EOF
 
-if [[ ! -x /frpc ]]; then
-  echo "[ERROR] /frpc not found or not executable inside the add-on image."
-  exit 1
-fi
-
+# Run frpc with retry loop
 while true; do
   echo "[INFO] starting frpc..."
   /frpc -c "${FRPC_TOML}" || true

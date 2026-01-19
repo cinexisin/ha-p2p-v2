@@ -3,18 +3,13 @@ FROM ${BUILD_FROM}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install tools needed to fetch frpc
-RUN apk add --no-cache curl tar ca-certificates
+# Install tools needed to fetch frpc + parse JSON
+RUN apk add --no-cache curl tar ca-certificates jq
 
-# Home Assistant add-on conventions
 WORKDIR /
 
 # ---- Install frpc (FRP client) ----
-# Pick FRP version (match your server/client version family)
 ARG FRP_VERSION="0.54.0"
-
-# TARGETARCH is provided by HA build system for multi-arch builds
-# Values: amd64, aarch64, armv7
 ARG TARGETARCH
 
 RUN set -eux; \
@@ -31,10 +26,7 @@ RUN set -eux; \
   chmod +x /frpc; \
   rm -rf /tmp/frp* /tmp/frp.tgz
 
-# Copy rootfs (s6/cont-init.d etc if you use it)
 COPY rootfs /
-
-# Copy run script
 COPY run.sh /usr/bin/run.sh
 RUN chmod +x /usr/bin/run.sh
 
