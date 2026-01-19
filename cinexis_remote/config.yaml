@@ -1,5 +1,5 @@
 name: "Cinexis Remote FRPC"
-version: "0.2.7"
+version: "0.2.8"
 slug: "cinexis_remote"
 description: "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)"
 arch:
