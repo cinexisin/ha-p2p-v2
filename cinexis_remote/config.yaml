@@ -1,5 +1,5 @@
 name: "Cinexis Remote"
-version: "0.2.0"
+version: "0.2.1"
 slug: "cinexis_remote"
 description: "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)"
 arch:
@@ -23,7 +23,7 @@ map:
 options:
   frps_host: "cinexis.cloud"
   frps_port: 7000
-  token: "CHANGE_ME_STRONG_TOKEN"
+  token: ""
   ha_scheme: "http"
   ha_host: "127.0.0.1"
   ha_port: 8123

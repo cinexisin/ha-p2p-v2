@@ -8,22 +8,27 @@ FRPC_TOML="/data/frpc.toml"
 
 mkdir -p "${STATE_DIR}"
 
-FRPS_HOST="$(jq -r '.frps_host // "cinexis.cloud"' "${OPTIONS}")"
-FRPS_PORT="$(jq -r '.frps_port // 7000' "${OPTIONS}")"
-TOKEN="$(jq -r '.token // ""' "${OPTIONS}")"
+# Defaults (work even if options UI is not available)
+FRPS_HOST="cinexis.cloud"
+FRPS_PORT="7000"
+TOKEN=""
+HA_SCHEME="http"
+HA_HOST="127.0.0.1"
+HA_PORT="8123"
 
-HA_SCHEME="$(jq -r '.ha_scheme // "http"' "${OPTIONS}")"
-HA_HOST="$(jq -r '.ha_host // "127.0.0.1"' "${OPTIONS}")"
-HA_PORT="$(jq -r '.ha_port // 8123' "${OPTIONS}")"
-
-if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "CHANGE_ME_STRONG_TOKEN" ]; then
-  echo ""
-  echo "[ERROR] Set a strong token in add-on options."
-  echo "It must match token in VPS: /opt/cinexis-cloud/frp/frps.ini"
-  echo ""
-  exit 1
+# If HA provides options.json, use it
+if [ -f "${OPTIONS}" ]; then
+  FRPS_HOST="$(jq -r '.frps_host // "'"${FRPS_HOST}"'"' "${OPTIONS}")"
+  FRPS_PORT="$(jq -r '.frps_port // '"${FRPS_PORT}"'' "${OPTIONS}")"
+  TOKEN="$(jq -r '.token // ""' "${OPTIONS}")"
+  HA_SCHEME="$(jq -r '.ha_scheme // "'"${HA_SCHEME}"'"' "${OPTIONS}")"
+  HA_HOST="$(jq -r '.ha_host // "'"${HA_HOST}"'"' "${OPTIONS}")"
+  HA_PORT="$(jq -r '.ha_port // '"${HA_PORT}"'' "${OPTIONS}")"
+else
+  echo "[WARN] ${OPTIONS} not found. Using defaults."
 fi
 
+# Persistent homeid
 if [ -f "${HOMEID_FILE}" ]; then
   HOMEID="$(cat "${HOMEID_FILE}")"
 else
@@ -45,12 +50,19 @@ echo " FRPS        : ${FRPS_HOST}:${FRPS_PORT}"
 echo "========================================"
 echo ""
 
+if [ -z "${TOKEN}" ]; then
+  echo "[WARN] token is empty. If your VPS frps.ini has token enabled, connection will fail."
+  echo "[WARN] Set token in add-on options to match VPS /opt/cinexis-cloud/frp/frps.ini"
+fi
+
 cat > "${FRPC_TOML}" <<EOF
 serverAddr = "${FRPS_HOST}"
 serverPort = ${FRPS_PORT}
+transport.tls.enable = true
+
+# Auth token (optional). If empty, FRP may reject depending on server config.
 auth.method = "token"
 auth.token = "${TOKEN}"
-transport.tls.enable = true
 
 [[proxies]]
 name = "ha_ui"
@@ -60,4 +72,10 @@ localPort = ${HA_PORT}
 customDomains = ["${PUBLIC_HOST}"]
 EOF
 
-exec /usr/bin/frpc -c "${FRPC_TOML}"
+# Keep the add-on alive even if frpc exits
+while true; do
+  echo "[INFO] starting frpc..."
+  /usr/bin/frpc -c "${FRPC_TOML}" || true
+  echo "[WARN] frpc exited. Retrying in 5 seconds..."
+  sleep 5
+done
