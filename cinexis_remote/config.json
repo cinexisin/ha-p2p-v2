@@ -7,24 +7,29 @@
   "startup": "services",
   "boot": "auto",
   "init": false,
-  "host_network": true,
+
+  "host_network": false,
   "ingress": false,
+
   "panel_icon": "mdi:cloud-lock",
-  "map": ["config:rw", "share:rw", "ssl:rw"],
+
   "options": {
-    "pair_api": "https://pair.cinexis.cloud",
-    "pair_code": "",
     "frps_host": "cinexis.cloud",
     "frps_port": 7000,
+
+    "pair_api": "https://pair.cinexis.cloud",
+    "pair_code": "",
+
     "ha_scheme": "http",
-    "ha_host": "127.0.0.1",
+    "ha_host": "homeassistant",
     "ha_port": 8123
   },
+
   "schema": {
-    "pair_api": "str",
-    "pair_code": "str?",
     "frps_host": "str",
     "frps_port": "int",
+    "pair_api": "str",
+    "pair_code": "str",
     "ha_scheme": "list(http|https)",
     "ha_host": "str",
     "ha_port": "int"
