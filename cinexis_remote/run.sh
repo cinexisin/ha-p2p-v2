@@ -3,11 +3,29 @@ set -euo pipefail
 
 CONFIG_PATH="/data/options.json"
 FRPC_TOML="/data/frpc.toml"
-STATE_JSON="/data/cinexis_remote.json"
+
+HOMEID_FILE="/data/cinexis_homeid"
+TOKEN_FILE="/data/cinexis_token"
 
 jq_get() {
   local key="$1"
   jq -r ".$key // empty" "$CONFIG_PATH"
+}
+
+read_file_trim() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    tr -d '\r\n' < "$f"
+  else
+    echo ""
+  fi
+}
+
+write_file_600() {
+  local f="$1"
+  local v="$2"
+  umask 077
+  printf "%s" "$v" > "$f"
 }
 
 FRPS_HOST="$(jq_get frps_host)"
@@ -15,56 +33,50 @@ FRPS_PORT="$(jq_get frps_port)"
 HA_SCHEME="$(jq_get ha_scheme)"
 HA_HOST="$(jq_get ha_host)"
 HA_PORT="$(jq_get ha_port)"
+
 PAIR_API="$(jq_get pair_api)"
 PAIR_CODE="$(jq_get pair_code)"
 
+if [[ -z "${FRPS_HOST}" ]]; then FRPS_HOST="cinexis.cloud"; fi
+if [[ -z "${FRPS_PORT}" ]]; then FRPS_PORT="7000"; fi
+if [[ -z "${HA_SCHEME}" ]]; then HA_SCHEME="http"; fi
+if [[ -z "${HA_HOST}" ]]; then HA_HOST="127.0.0.1"; fi
 if [[ -z "${HA_PORT}" ]]; then HA_PORT="8123"; fi
+if [[ -z "${PAIR_API}" ]]; then PAIR_API="https://pair.cinexis.cloud"; fi
 
-# Load existing state (home_id/token) if present
-HOME_ID=""
-TOKEN=""
+HOME_ID="$(read_file_trim "${HOMEID_FILE}")"
+TOKEN="$(read_file_trim "${TOKEN_FILE}")"
 
-if [[ -f "${STATE_JSON}" ]]; then
-  HOME_ID="$(jq -r '.home_id // empty' "${STATE_JSON}" 2>/dev/null || true)"
-  TOKEN="$(jq -r '.token // empty' "${STATE_JSON}" 2>/dev/null || true)"
-fi
-
-# If missing state, pair using pair_code
-if [[ -z "${HOME_ID}" || -z "${TOKEN}" ]]; then
-  if [[ -z "${PAIR_CODE}" ]]; then
-    echo "[ERROR] Pairing not completed yet."
-    echo "        Please enter your 6-digit Pair Code in the add-on configuration and start again."
-    exit 1
-  fi
-
-  if [[ -z "${PAIR_API}" ]]; then
-    echo "[ERROR] pair_api is empty."
-    exit 1
-  fi
-
+if [[ ( -z "${HOME_ID}" || -z "${TOKEN}" ) && -n "${PAIR_CODE}" ]]; then
   echo "[INFO] Pairing with Cinexis Cloud..."
+  set +e
   RESP="$(curl -fsSL -X POST "${PAIR_API}/pair/confirm" \
     -H "Content-Type: application/json" \
-    -d "{\"code\":\"${PAIR_CODE}\"}")" || {
-      echo "[ERROR] Pairing failed. Check Pair Code and connectivity to ${PAIR_API}."
-      exit 1
-    }
+    -d "{\"code\":\"${PAIR_CODE}\"}" 2>/dev/null)"
+  CURL_RC=$?
+  set -e
 
-  HOME_ID="$(echo "${RESP}" | jq -r '.home_id // empty')"
-  TOKEN="$(echo "${RESP}" | jq -r '.token // empty')"
+  if [[ "${CURL_RC}" -ne 0 || -z "${RESP}" ]]; then
+    echo "[WARN] Pairing failed (could not confirm code). Please verify the code and try again."
+  else
+    NEW_HOME_ID="$(echo "${RESP}" | jq -r '.home_id // empty')"
+    NEW_TOKEN="$(echo "${RESP}" | jq -r '.token // empty')"
 
-  if [[ -z "${HOME_ID}" || -z "${TOKEN}" ]]; then
-    echo "[ERROR] Pairing response missing home_id/token."
-    echo "Response: ${RESP}"
-    exit 1
+    if [[ -n "${NEW_HOME_ID}" && -n "${NEW_TOKEN}" ]]; then
+      HOME_ID="${NEW_HOME_ID}"
+      TOKEN="${NEW_TOKEN}"
+      write_file_600 "${HOMEID_FILE}" "${HOME_ID}"
+      write_file_600 "${TOKEN_FILE}" "${TOKEN}"
+      echo "[INFO] Pairing success. HomeID saved."
+    else
+      echo "[WARN] Pairing response missing home_id/token. Response was: ${RESP}"
+    fi
   fi
+fi
 
-  # Persist state
-  cat > "${STATE_JSON}" <<EOF
-{"home_id":"${HOME_ID}","token":"${TOKEN}","paired_at":"$(date -u +%FT%TZ)"}
-EOF
-
-  echo "[INFO] Pairing OK. HomeID saved."
+if [[ -z "${HOME_ID}" ]]; then
+  HOME_ID="$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 20)"
+  write_file_600 "${HOMEID_FILE}" "${HOME_ID}"
 fi
 
 PUBLIC_URL="https://${HOME_ID}.ha.cinexis.cloud"
@@ -79,7 +91,12 @@ echo " HA Target   : ${HA_TARGET}"
 echo " FRPS        : ${FRPS_HOST}:${FRPS_PORT}"
 echo "========================================"
 
-# Write frpc.toml
+if [[ -z "${TOKEN}" ]]; then
+  echo "[ERROR] No token available."
+  echo "        Enter a valid pair_code in the add-on config, then Start the add-on again."
+  exit 1
+fi
+
 cat > "${FRPC_TOML}" <<EOF
 serverAddr = "${FRPS_HOST}"
 serverPort = ${FRPS_PORT}

@@ -27,6 +27,6 @@
     "ha_host": "str",
     "ha_port": "int",
     "pair_api": "str",
-    "pair_code": "str"
+    "pair_code": "str?"
   }
 }
