@@ -1,60 +1,51 @@
-#!/usr/bin/with-contenv bash
+#!/usr/bin/with-contenv bashio
 set -euo pipefail
 
-OPTIONS="/data/options.json"
-STATE_DIR="/data/state"
-HOMEID_FILE="${STATE_DIR}/homeid"
-FRPC_TOML="/data/frpc.toml"
+# --- Read options from add-on config ---
+FRPS_HOST="$(bashio::config 'frps_host')"
+FRPS_PORT="$(bashio::config 'frps_port')"
+TOKEN="$(bashio::config 'token')"
 
-mkdir -p "${STATE_DIR}"
+HA_SCHEME="$(bashio::config 'ha_scheme')"
+HA_HOST="$(bashio::config 'ha_host')"
+HA_PORT="$(bashio::config 'ha_port')"
 
-FRPS_HOST="cinexis.cloud"
-FRPS_PORT="7000"
-TOKEN=""
-HA_SCHEME="http"
-HA_HOST="127.0.0.1"
-HA_PORT="8123"
+# Optional override if you want fixed HomeID; otherwise derived from machine-id
+HOME_ID_OVERRIDE="$(bashio::config 'home_id' || true)"
 
-if [ -f "${OPTIONS}" ]; then
-  FRPS_HOST="$(jq -r '.frps_host // "'"${FRPS_HOST}"'"' "${OPTIONS}")"
-  FRPS_PORT="$(jq -r '.frps_port // '"${FRPS_PORT}"'' "${OPTIONS}")"
-  TOKEN="$(jq -r '.token // ""' "${OPTIONS}")"
-  HA_SCHEME="$(jq -r '.ha_scheme // "'"${HA_SCHEME}"'"' "${OPTIONS}")"
-  HA_HOST="$(jq -r '.ha_host // "'"${HA_HOST}"'"' "${OPTIONS}")"
-  HA_PORT="$(jq -r '.ha_port // '"${HA_PORT}"'' "${OPTIONS}")"
+# --- Generate a stable HomeID ---
+if [[ -n "${HOME_ID_OVERRIDE:-}" && "${HOME_ID_OVERRIDE:-null}" != "null" ]]; then
+  HOME_ID="${HOME_ID_OVERRIDE}"
 else
-  echo "[WARN] ${OPTIONS} not found. Using defaults."
+  # Stable across restarts; different per machine
+  if [[ -f /etc/machine-id ]]; then
+    HOME_ID="$(cut -c1-20 /etc/machine-id)"
+  else
+    HOME_ID="$(head -c 32 /dev/urandom | sha256sum | cut -c1-20)"
+  fi
 fi
 
-if [ -f "${HOMEID_FILE}" ]; then
-  HOMEID="$(cat "${HOMEID_FILE}")"
-else
-  HOMEID="$(head -c 10 /dev/urandom | xxd -p -c 256)"
-  echo "${HOMEID}" > "${HOMEID_FILE}"
-fi
-
-PUBLIC_HOST="${HOMEID}.ha.cinexis.cloud"
+PUBLIC_HOST="${HOME_ID}.ha.cinexis.cloud"
 PUBLIC_URL="https://${PUBLIC_HOST}"
+HA_TARGET="${HA_SCHEME}://${HA_HOST}:${HA_PORT}"
 
-echo ""
-echo "========================================"
-echo " Cinexis Remote FRPC"
-echo "----------------------------------------"
-echo " HomeID      : ${HOMEID}"
-echo " Public URL  : ${PUBLIC_URL}"
-echo " HA Target   : ${HA_SCHEME}://${HA_HOST}:${HA_PORT}"
-echo " FRPS        : ${FRPS_HOST}:${FRPS_PORT}"
-echo "========================================"
-echo ""
+bashio::log.info "========================================"
+bashio::log.info " Cinexis Remote FRPC"
+bashio::log.info "----------------------------------------"
+bashio::log.info " HomeID      : ${HOME_ID}"
+bashio::log.info " Public URL  : ${PUBLIC_URL}"
+bashio::log.info " HA Target   : ${HA_TARGET}"
+bashio::log.info " FRPS        : ${FRPS_HOST}:${FRPS_PORT}"
+bashio::log.info "========================================"
 
-if [ -z "${TOKEN}" ]; then
-  echo "[WARN] token is empty. If VPS frps.ini has token enabled, connection will fail."
-fi
-
-cat > "${FRPC_TOML}" <<EOF
+# --- Write FRPC config (TOML) ---
+# IMPORTANT:
+# - type=http enables vhost routing in frps (vhost_http_port=8080)
+# - host_header_rewrite makes HA see a safe Host (localhost)
+# - request_headers ensures HA sees https + correct external host
+cat > /data/frpc.toml <<EOF
 serverAddr = "${FRPS_HOST}"
 serverPort = ${FRPS_PORT}
-transport.tls.enable = true
 auth.method = "token"
 auth.token = "${TOKEN}"
 
@@ -64,11 +55,19 @@ type = "http"
 localIP = "${HA_HOST}"
 localPort = ${HA_PORT}
 customDomains = ["${PUBLIC_HOST}"]
+
+# Make HA happier behind proxy
+hostHeaderRewrite = "127.0.0.1"
+
+[proxies.transport]
+useEncryption = true
+useCompression = true
+
+[proxies.requestHeaders]
+set.X-Forwarded-Proto = "https"
+set.X-Forwarded-Host = "${PUBLIC_HOST}"
+set.X-Forwarded-Port = "443"
 EOF
 
-while true; do
-  echo "[INFO] starting frpc..."
-  /usr/bin/frpc -c "${FRPC_TOML}" || true
-  echo "[WARN] frpc exited. Retrying in 5 seconds..."
-  sleep 5
-done
+bashio::log.info "[INFO] starting frpc..."
+exec /usr/local/bin/frpc -c /data/frpc.toml
