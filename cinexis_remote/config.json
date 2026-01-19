@@ -1,6 +1,6 @@
 {
   "name": "Cinexis Remote FRPC",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "slug": "cinexis_remote",
   "description": "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)",
   "arch": ["amd64", "aarch64", "armv7"],
@@ -17,6 +17,8 @@
   "map": ["config:rw", "share:rw", "ssl:rw"],
 
   "options": {
+    "pair_api": "https://pair.cinexis.cloud",
+    "pair_code": "",
     "frps_host": "cinexis.cloud",
     "frps_port": 7000,
     "token": "",
@@ -27,6 +29,8 @@
   },
 
   "schema": {
+    "pair_api": "str",
+    "pair_code": "str",
     "frps_host": "str",
     "frps_port": "int",
     "token": "password",
