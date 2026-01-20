@@ -2,30 +2,29 @@
   "name": "Cinexis Remote FRPC",
   "version": "0.2.8",
   "slug": "cinexis_remote",
-  "description": "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)\n\nLicensing:\n- license_key: required (e.g. CINX-DEMO-0001)\n- frps_addr/frps_port: optional (defaults to VPS IP + 7000)\n- ha_subdomain_suffix: optional (default .ha.cinexis.cloud)\n",
-  "arch": [
-    "amd64",
-    "aarch64",
-    "armv7"
-  ],
+  "description": "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)",
+  "arch": ["amd64", "aarch64", "armv7"],
   "startup": "services",
   "boot": "auto",
   "init": false,
+
   "host_network": false,
   "ingress": false,
+
   "panel_icon": "mdi:cloud-lock",
+
   "options": {
     "frps_host": "cinexis.cloud",
     "frps_port": 7000,
+
     "pair_api": "https://pair.cinexis.cloud",
     "pair_code": "",
+
     "ha_scheme": "http",
     "ha_host": "homeassistant",
-    "ha_port": 8123,
-    "license_key": "",
-    "frps_addr": "139.99.56.240",
-    "ha_subdomain_suffix": ".ha.cinexis.cloud"
+    "ha_port": 8123
   },
+
   "schema": {
     "frps_host": "str",
     "frps_port": "int",
@@ -33,9 +32,6 @@
     "pair_code": "str",
     "ha_scheme": "list(http|https)",
     "ha_host": "str",
-    "ha_port": "int",
-    "license_key": "str",
-    "frps_addr": "str?",
-    "ha_subdomain_suffix": "str?"
+    "ha_port": "int"
   }
 }

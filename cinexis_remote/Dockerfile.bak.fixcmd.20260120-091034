@@ -30,6 +30,7 @@ COPY rootfs /
 COPY run.sh /usr/bin/run.sh
 RUN chmod +x /usr/bin/run.sh
 
+CMD ["/usr/bin/run.sh"]
 
 # --- Cinexis OIDC Licensing Patch (20260120-090705) ---
 # Install frpc 0.66.0 and use deterministic entrypoint.
@@ -50,6 +51,4 @@ RUN set -eux; \
 
 COPY rootfs/ /
 
-
-# --- Cinexis single CMD (deterministic) ---
 CMD ["/usr/bin/cinexis-entrypoint.sh"]

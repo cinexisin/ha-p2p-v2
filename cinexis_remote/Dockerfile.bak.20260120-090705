@@ -1,4 +1,4 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19
+ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -30,26 +30,4 @@ COPY rootfs /
 COPY run.sh /usr/bin/run.sh
 RUN chmod +x /usr/bin/run.sh
 
-
-# --- Cinexis OIDC Licensing Patch (20260120-090705) ---
-# Install frpc 0.66.0 and use deterministic entrypoint.
-RUN set -eux; \
-    apk add --no-cache curl ca-certificates; \
-    ARCH="$(uname -m)"; \
-    case "$ARCH" in \
-      x86_64) FRP_ARCH="amd64" ;; \
-      aarch64) FRP_ARCH="arm64" ;; \
-      armv7l) FRP_ARCH="arm" ;; \
-      *) echo "Unsupported arch: $ARCH" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL -o /tmp/frp.tgz "https://github.com/fatedier/frp/releases/download/v0.66.0/frp_0.66.0_linux_${FRP_ARCH}.tar.gz"; \
-    tar -xzf /tmp/frp.tgz -C /tmp; \
-    cp -f "/tmp/frp_0.66.0_linux_${FRP_ARCH}/frpc" /usr/local/bin/frpc; \
-    chmod +x /usr/local/bin/frpc; \
-    rm -rf /tmp/frp* /tmp/frp_0.66.0_linux_${FRP_ARCH}
-
-COPY rootfs/ /
-
-
-# --- Cinexis single CMD (deterministic) ---
-CMD ["/usr/bin/cinexis-entrypoint.sh"]
+CMD ["/usr/bin/run.sh"]
