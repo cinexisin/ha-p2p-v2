@@ -50,6 +50,19 @@ if [ ! -f "$SECRET_FILE" ]; then
   cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48 > "$SECRET_FILE"
 fi
 DEVICE_SECRET="$(cat "$SECRET_FILE" | tr -d '\r\n')"
+# Debug mode: print device_secret once (for server-side binding) then exit.
+DEBUG_PRINT_SECRET="false"
+if [ -f /data/options.json ]; then
+  DEBUG_PRINT_SECRET="$(sed -n 's/.*"debug_print_secret"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' /data/options.json | head -n 1)"
+fi
+if [ "${DEBUG_PRINT_SECRET:-false}" = "true" ]; then
+  echo "=== DEBUG: device_secret (copy this) ==="
+  echo "$DEVICE_SECRET"
+  echo "=== END DEBUG ==="
+  echo "Turn off debug_print_secret after copying."
+  exit 0
+fi
+
 
 # Read LICENSE_KEY from /data/options.json (Home Assistant add-on options)
 # We avoid jq dependency by parsing minimally.
