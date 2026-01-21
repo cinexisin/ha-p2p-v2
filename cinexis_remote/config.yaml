@@ -1,18 +1,17 @@
 name: "Cinexis Remote FRPC"
-version: "0.2.12"
+version: "0.2.13"
 slug: "cinexis_remote"
 description: "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)"
+url: "https://github.com/cinexisin/ha-p2p-v2"
 arch:
   - amd64
   - aarch64
   - armv7
-
 startup: services
 boot: auto
 init: false
 host_network: false
 ingress: false
-
 panel_icon: "mdi:cloud-lock"
 
 options:
@@ -29,6 +28,6 @@ schema:
   frps_port: int
   pair_api: str
   pair_code: str
-  ha_scheme: list(http|https)
+  ha_scheme: "list(http|https)"
   ha_host: str
   ha_port: int
