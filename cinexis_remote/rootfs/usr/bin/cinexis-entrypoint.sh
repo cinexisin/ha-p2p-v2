@@ -124,7 +124,7 @@ auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 [[proxies]]
 name = "ha_ui"
 type = "http"
-localIP = "127.0.0.1"
+localIP = "homeassistant"
 localPort = 8123
 customDomains = ["${VHOST}"]
 TOML
