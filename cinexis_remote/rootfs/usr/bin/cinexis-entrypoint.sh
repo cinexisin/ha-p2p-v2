@@ -125,7 +125,7 @@ auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 name = "ha_ui"
 type = "http"
 localIP = "homeassistant"
-localPort = 8123
+localPort = $HA_PORT
 customDomains = ["${VHOST}"]
 TOML
 
