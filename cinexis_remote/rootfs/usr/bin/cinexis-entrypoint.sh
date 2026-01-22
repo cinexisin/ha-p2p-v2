@@ -1,5 +1,9 @@
 #!/usr/bin/with-contenv bash
-set -euo pipefail
+set -Eeuo pipefail
+
+trap 'echo "Cinexis ERROR: line=$LINENO exit=$?"; exit 1' ERR
+
+log(){ echo "[cinexis] $*"; }
 
 FRPS_ADDR="${FRPS_ADDR:-139.99.56.240}"
 FRPS_PORT="${FRPS_PORT:-7000}"
@@ -17,8 +21,8 @@ SECRET_FILE="$DATA_DIR/device_secret"
 LICENSE_CACHE="$DATA_DIR/license_key"
 FRPC_TOML="$DATA_DIR/frpc.toml"
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
-need curl; need sed; need tr; need awk
+need() { command -v "$1" >/dev/null 2>&1 || { log "ERROR: missing $1"; exit 1; }; }
+need curl; need sed; need tr
 
 gen_uuid() {
   if command -v uuidgen >/dev/null 2>&1; then
@@ -62,26 +66,27 @@ if [ ! -s "$SECRET_FILE" ]; then
 fi
 DEVICE_SECRET="$(tr -d '\r\n' < "$SECRET_FILE")"
 
-echo "Cinexis node_id: $NODE_ID"
+log "entrypoint starting"
+log "node_id: $NODE_ID"
 
-# HA upstream: prefer Supervisor DNS name "homeassistant"
+# Determine HA upstream (prefer Supervisor DNS)
 HASS_UPSTREAM="homeassistant"
 if curl -fsS --max-time 2 "http://homeassistant:${HA_PORT}/" >/dev/null 2>&1; then
   :
 else
-  GW="$(ip route | awk '/default/ {print $3; exit}' || true)"
+  # gateway fallback (best-effort; don't fail if ip is missing)
+  GW="$( (command -v ip >/dev/null 2>&1 && ip route 2>/dev/null | sed -n 's/^default via \([^ ]*\).*/\1/p' | head -n1) || true )"
   if [ -n "${GW:-}" ] && curl -fsS --max-time 2 "http://${GW}:${HA_PORT}/" >/dev/null 2>&1; then
     HASS_UPSTREAM="$GW"
   fi
 fi
-echo "==> HA upstream selected: ${HASS_UPSTREAM}:${HA_PORT}"
+log "HA upstream selected: ${HASS_UPSTREAM}:${HA_PORT}"
 
 DEBUG_PRINT_SECRET="$(opt_bool debug_print_secret false)"
 if [ "$DEBUG_PRINT_SECRET" = "true" ]; then
-  echo "=== DEBUG: device_secret (copy this) ==="
+  log "DEBUG device_secret:"
   echo "$DEVICE_SECRET"
-  echo "=== END DEBUG ==="
-  echo "Turn off debug_print_secret after copying."
+  log "Turn off debug_print_secret after copying."
   exit 0
 fi
 
@@ -99,11 +104,11 @@ claim_once() {
   code="$(curl -sS -o /tmp/claim.out -w '%{http_code}' -X POST "$CLAIM_URL" \
     -H 'Content-Type: application/json' -d "$payload" || true)"
   if [ "$code" = "200" ] || [ "$code" = "409" ]; then
-    echo "License claim OK (http $code)"
+    log "License claim OK (http $code)"
     printf '%s\n' "$LICENSE_KEY" > "$LICENSE_CACHE"
     return 0
   fi
-  echo "Claim failed (http $code):"
+  log "Claim failed (http $code)"
   [ -f /tmp/claim.out ] && cat /tmp/claim.out || true
   return 1
 }
@@ -114,50 +119,53 @@ heartbeat_once() {
   code="$(curl -sS -o /tmp/hb.out -w '%{http_code}' -X POST "$HEARTBEAT_URL" \
     -H 'Content-Type: application/json' -d "$payload" || true)"
   if [ "$code" != "200" ]; then
-    echo "Heartbeat failed (http $code)"
+    log "Heartbeat failed (http $code)"
     [ -f /tmp/hb.out ] && cat /tmp/hb.out || true
     return 2
   fi
   if grep -q '"allowed":true' /tmp/hb.out; then
-    echo "License status: allowed ✅"
+    log "License status: allowed ✅"
     return 0
   fi
-  echo "License status: NOT allowed yet."
+  log "License status: NOT allowed yet"
   cat /tmp/hb.out || true
   return 1
 }
 
 if [ -n "${LICENSE_KEY:-}" ]; then
-  echo "==> Claiming license (idempotent)"
+  log "Claiming license (idempotent)"
   for i in 1 2 3 4 5; do
     if claim_once; then break; fi
-    echo "Retrying claim in ${RETRY_SECS}s... (attempt $i/5)"
+    log "Retrying claim in ${RETRY_SECS}s (attempt $i/5)"
     sleep "$RETRY_SECS"
   done
 else
-  echo "==> No license_key set. Using node-based licensing."
-  echo "==> Assign a license to this node_id in Cinexis Console:"
-  echo "    node_id=$NODE_ID"
+  log "No license_key set. Node-based licensing mode."
+  log "Assign a license to node_id in console: $NODE_ID"
 fi
 
-echo "==> Heartbeat check"
+log "Heartbeat check"
 while true; do
   set +e
   heartbeat_once
   rc=$?
   set -e
+
   if [ "$rc" = "0" ]; then
     break
   fi
+
   if [ "$AUTO_WAIT" != "true" ]; then
-    echo "ERROR: Not allowed and auto_wait_for_license=false. Exiting."
+    log "Not allowed and auto_wait_for_license=false. Exiting."
     exit 1
   fi
-  echo "Waiting ${RETRY_SECS}s for license to be assigned..."
+
+  log "Waiting ${RETRY_SECS}s for license / API availability..."
   sleep "$RETRY_SECS"
 done
 
 VHOST="${NODE_ID}${HA_SUBDOMAIN_SUFFIX}"
+
 cat > "$FRPC_TOML" <<TOML
 serverAddr = "${FRPS_ADDR}"
 serverPort = ${FRPS_PORT}
@@ -176,5 +184,17 @@ localPort = ${HA_PORT}
 customDomains = ["${VHOST}"]
 TOML
 
-echo "==> Starting frpc with OIDC auth"
-exec /usr/local/bin/frpc -c "$FRPC_TOML"
+# Locate frpc binary safely
+FRPC_BIN="/usr/local/bin/frpc"
+[ -x "$FRPC_BIN" ] || FRPC_BIN="/usr/bin/frpc"
+[ -x "$FRPC_BIN" ] || { log "ERROR: frpc not found"; ls -ლა /usr/local/bin /usr/bin || true; exit 1; }
+
+log "Starting frpc (auto-restart loop enabled)"
+while true; do
+  set +e
+  "$FRPC_BIN" -c "$FRPC_TOML"
+  rc=$?
+  set -e
+  log "frpc exited (rc=$rc). Restarting in ${RETRY_SECS}s..."
+  sleep "$RETRY_SECS"
+done
