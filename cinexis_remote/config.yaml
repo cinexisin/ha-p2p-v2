@@ -1,5 +1,5 @@
 name: Cinexis Remote FRPC
-version: 0.2.15
+version: "0.2.16"
 slug: cinexis_remote
 description: >-
   Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP).
@@ -29,6 +29,8 @@ options:
   ha_subdomain_suffix: ".ha.cinexis.cloud"
   debug_print_secret: false
 
+  auto_wait_for_license: true
+  retry_seconds: 15
 schema:
   frps_host: str
   frps_port: int
@@ -37,7 +39,9 @@ schema:
   ha_scheme: list(http|https)
   ha_host: str
   ha_port: int
-  license_key: str
+  license_key: password?
   frps_addr: str
   ha_subdomain_suffix: str
   debug_print_secret: bool
+  auto_wait_for_license: bool
+  retry_seconds: int
