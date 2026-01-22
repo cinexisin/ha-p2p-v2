@@ -1,13 +1,6 @@
 #!/usr/bin/env sh
 set -eu
 
-# Required env/config:
-#   LICENSE_KEY (string) - provided via add-on options
-# Optional:
-#   FRPS_ADDR (default 139.99.56.240)
-#   FRPS_PORT (default 7000)
-#   HA_SUBDOMAIN_SUFFIX (default .ha.cinexis.cloud)
-
 FRPS_ADDR="${FRPS_ADDR:-139.99.56.240}"
 FRPS_PORT="${FRPS_PORT:-7000}"
 HA_SUBDOMAIN_SUFFIX="${HA_SUBDOMAIN_SUFFIX:-.ha.cinexis.cloud}"
@@ -19,21 +12,19 @@ HEARTBEAT_URL="https://api.cinexis.cloud/licensing/v1/nodes/heartbeat"
 DATA_DIR="/data"
 NODE_ID_FILE="$DATA_DIR/node_id"
 SECRET_FILE="$DATA_DIR/device_secret"
+FRPC_TOML="$DATA_DIR/frpc.toml"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 1; }; }
 
 need curl
-need sh
 need sed
 need tr
 
-# uuid generator (busybox-compatible)
 gen_uuid() {
   if command -v uuidgen >/dev/null 2>&1; then
     uuidgen | tr 'A-Z' 'a-z'
   else
-    # fallback: 32 hex -> uuid format
-    h="$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c 32)"
+    h="$(tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
     echo "${h}" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
   fi
 }
@@ -43,14 +34,13 @@ mkdir -p "$DATA_DIR"
 if [ ! -f "$NODE_ID_FILE" ]; then
   gen_uuid > "$NODE_ID_FILE"
 fi
-NODE_ID="$(cat "$NODE_ID_FILE" | tr -d '\r\n' | tr 'A-Z' 'a-z')"
+NODE_ID="$(tr -d '\r\n' <"$NODE_ID_FILE" | tr 'A-Z' 'a-z')"
 
 if [ ! -f "$SECRET_FILE" ]; then
-  # 48 chars secret
-  cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48 > "$SECRET_FILE"
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 > "$SECRET_FILE"
 fi
-DEVICE_SECRET="$(cat "$SECRET_FILE" | tr -d '\r\n')"
-# Debug mode: print device_secret once (for server-side binding) then exit.
+DEVICE_SECRET="$(tr -d '\r\n' <"$SECRET_FILE")"
+
 DEBUG_PRINT_SECRET="false"
 if [ -f /data/options.json ]; then
   DEBUG_PRINT_SECRET="$(sed -n 's/.*"debug_print_secret"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' /data/options.json | head -n 1)"
@@ -63,24 +53,46 @@ if [ "${DEBUG_PRINT_SECRET:-false}" = "true" ]; then
   exit 0
 fi
 
-
-# Read LICENSE_KEY from /data/options.json (Home Assistant add-on options)
-# We avoid jq dependency by parsing minimally.
 LICENSE_KEY=""
 if [ -f /data/options.json ]; then
   LICENSE_KEY="$(sed -n 's/.*"license_key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /data/options.json | head -n 1)"
 fi
-
 if [ -z "${LICENSE_KEY}" ]; then
   echo "ERROR: license_key is not set in add-on options (/data/options.json)."
   echo "Set it and restart the add-on."
   exit 1
 fi
 
+HA_HOST=""
+HA_PORT=""
+if [ -f /data/options.json ]; then
+  HA_HOST="$(sed -n 's/.*"ha_host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /data/options.json | head -n 1 || true)"
+  HA_PORT="$(sed -n 's/.*"ha_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' /data/options.json | head -n 1 || true)"
+fi
+
+HA_HOST="${HA_HOST:-homeassistant}"
+HA_PORT="${HA_PORT:-8123}"
+
+probe() { curl -fsS --max-time 2 "http://$1:$2/" >/dev/null 2>&1; }
+
+if probe "$HA_HOST" "$HA_PORT"; then
+  :
+elif probe "homeassistant" "8123"; then
+  HA_HOST="homeassistant"
+  HA_PORT="8123"
+elif probe "127.0.0.1" "8123"; then
+  HA_HOST="127.0.0.1"
+  HA_PORT="8123"
+else
+  echo "ERROR: Cannot reach Home Assistant UI from inside the add-on."
+  echo "Tried: ${HA_HOST}:${HA_PORT}, homeassistant:8123, 127.0.0.1:8123"
+  exit 1
+fi
+
 echo "Cinexis node_id: $NODE_ID"
+echo "==> HA upstream selected: ${HA_HOST}:${HA_PORT}"
 
 echo "==> Claiming license (idempotent)"
-# If already claimed, server returns ok or conflict; we treat 409 as ok.
 claim_payload="$(printf '{"license_key":"%s","node_id":"%s","device_secret":"%s"}' "$LICENSE_KEY" "$NODE_ID" "$DEVICE_SECRET")"
 http_code="$(curl -sS -o /tmp/claim.out -w '%{http_code}' -X POST "$CLAIM_URL" -H 'Content-Type: application/json' -d "$claim_payload" || true)"
 if [ "$http_code" = "200" ] || [ "$http_code" = "409" ]; then
@@ -107,8 +119,6 @@ else
   exit 1
 fi
 
-# Write FRPC config (TOML, FRP 0.66+)
-FRPC_TOML="$DATA_DIR/frpc.toml"
 VHOST="${NODE_ID}${HA_SUBDOMAIN_SUFFIX}"
 
 cat > "$FRPC_TOML" <<TOML
@@ -124,8 +134,8 @@ auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 [[proxies]]
 name = "ha_ui"
 type = "http"
-localIP = "homeassistant"
-localPort = $HA_PORT
+localIP = "${HA_HOST}"
+localPort = ${HA_PORT}
 customDomains = ["${VHOST}"]
 TOML
 
