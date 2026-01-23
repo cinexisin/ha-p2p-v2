@@ -1,5 +1,5 @@
 name: Cinexis Remote FRPC
-version: "0.2.20"
+version: "0.2.21"
 slug: cinexis_remote
 description: >-
   Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP).
@@ -18,4 +18,6 @@ panel_icon: mdi:cloud-lock
   auto_wait_for_license: true
   retry_seconds: 15
 
-homeassistant_api: true
+map:
+  - share:rw
+  - config:ro

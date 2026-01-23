@@ -12,9 +12,15 @@ NAME_URL="${API_BASE}/licensing/v1/nodes/name"
 HEARTBEAT_URL="${API_BASE}/licensing/v1/nodes/heartbeat"
 
 DATA_DIR="/data"
-NODE_ID_FILE="$DATA_DIR/node_id"
-SECRET_FILE="$DATA_DIR/device_secret"
-FRPC_TOML="$DATA_DIR/frpc.toml"
+SHARE_DIR="/share/cinexis"
+
+NODE_ID_FILE_DATA="${DATA_DIR}/node_id"
+NODE_ID_FILE_SHARE="${SHARE_DIR}/node_id"
+
+SECRET_FILE_DATA="${DATA_DIR}/device_secret"
+SECRET_FILE_SHARE="${SHARE_DIR}/device_secret"
+
+FRPC_TOML="${DATA_DIR}/frpc.toml"
 
 HA_HOST="${HA_HOST:-homeassistant}"
 HA_PORT="${HA_PORT:-8123}"
@@ -23,6 +29,11 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "[cinexis] ERROR: missing $1"
 need curl
 need sed
 need tr
+
+mkdir -p "$DATA_DIR" || true
+if [ -d /share ]; then
+  mkdir -p "$SHARE_DIR" || true
+fi
 
 uuid_ok() {
   echo "$1" | tr 'A-Z' 'a-z' | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
@@ -33,41 +44,70 @@ gen_uuid() {
     cat /proc/sys/kernel/random/uuid 2>/dev/null | tr 'A-Z' 'a-z'
     return 0
   fi
-  # fallback: 32 hex -> uuid format
   h="$(tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
   echo "$h" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
 }
 
-mkdir -p "$DATA_DIR"
+atomic_write() {
+  f="$1"
+  v="$2"
+  tmp="${f}.tmp.$$"
+  printf "%s\n" "$v" > "$tmp"
+  mv -f "$tmp" "$f"
+}
 
-if [ ! -f "$NODE_ID_FILE" ]; then
-  gen_uuid > "$NODE_ID_FILE"
-fi
-NODE_ID="$(cat "$NODE_ID_FILE" 2>/dev/null | tr -d '\r\n' | tr 'A-Z' 'a-z' || true)"
+read_first() {
+  for f in "$@"; do
+    if [ -s "$f" ]; then
+      cat "$f" 2>/dev/null | tr -d '\r\n'
+      return 0
+    fi
+  done
+  return 1
+}
 
-# If node_id ever got corrupted (you saw "cinexis error: line=32..." earlier), regenerate cleanly
+# -------- node_id (prefer /share) --------
+NODE_ID="$(read_first "$NODE_ID_FILE_SHARE" "$NODE_ID_FILE_DATA" || true)"
+NODE_ID="$(echo "${NODE_ID:-}" | tr 'A-Z' 'a-z' | tr -d '\r\n')"
+
 if ! uuid_ok "$NODE_ID"; then
-  echo "[cinexis] WARNING: node_id corrupted; regenerating"
-  gen_uuid > "$NODE_ID_FILE"
-  NODE_ID="$(cat "$NODE_ID_FILE" | tr -d '\r\n' | tr 'A-Z' 'a-z')"
+  echo "[cinexis] node_id missing/corrupt -> generating new"
+  NODE_ID="$(gen_uuid)"
+  # write to share first (strongest persistence), then data
+  if [ -d "$SHARE_DIR" ]; then atomic_write "$NODE_ID_FILE_SHARE" "$NODE_ID"; fi
+  atomic_write "$NODE_ID_FILE_DATA" "$NODE_ID"
+else
+  # ensure both locations have it (copy forward)
+  if [ -d "$SHARE_DIR" ] && [ ! -s "$NODE_ID_FILE_SHARE" ]; then atomic_write "$NODE_ID_FILE_SHARE" "$NODE_ID"; fi
+  if [ ! -s "$NODE_ID_FILE_DATA" ]; then atomic_write "$NODE_ID_FILE_DATA" "$NODE_ID"; fi
 fi
 
-if [ ! -f "$SECRET_FILE" ]; then
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 > "$SECRET_FILE"
+# -------- device_secret (prefer /share) --------
+DEVICE_SECRET="$(read_first "$SECRET_FILE_SHARE" "$SECRET_FILE_DATA" || true)"
+DEVICE_SECRET="$(echo "${DEVICE_SECRET:-}" | tr -d '\r\n')"
+
+if [ -z "${DEVICE_SECRET:-}" ]; then
+  echo "[cinexis] device_secret missing -> generating new"
+  DEVICE_SECRET="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48)"
+  if [ -d "$SHARE_DIR" ]; then atomic_write "$SECRET_FILE_SHARE" "$DEVICE_SECRET"; fi
+  atomic_write "$SECRET_FILE_DATA" "$DEVICE_SECRET"
+else
+  if [ -d "$SHARE_DIR" ] && [ ! -s "$SECRET_FILE_SHARE" ]; then atomic_write "$SECRET_FILE_SHARE" "$DEVICE_SECRET"; fi
+  if [ ! -s "$SECRET_FILE_DATA" ]; then atomic_write "$SECRET_FILE_DATA" "$DEVICE_SECRET"; fi
 fi
-DEVICE_SECRET="$(cat "$SECRET_FILE" | tr -d '\r\n')"
 
 get_ha_name() {
-  # Uses Home Assistant API token injected by homeassistant_api: true
-  if [ -n "${HOMEASSISTANT_TOKEN:-}" ]; then
-    n="$(curl -fsSL --connect-timeout 3 \
-      -H "Authorization: Bearer ${HOMEASSISTANT_TOKEN}" \
-      "http://${HA_HOST}:${HA_PORT}/api/config" 2>/dev/null \
-      | tr -d '\n' \
+  # No HA API perms needed: read HA's storage file (read-only)
+  if [ -r /config/.storage/core.config ]; then
+    n="$(tr -d '\n' </config/.storage/core.config \
       | sed -n 's/.*"location_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
       | head -n1 || true)"
-    [ -n "${n:-}" ] && echo "$n" && return
+    if [ -n "${n:-}" ]; then
+      echo "$n"
+      return
+    fi
   fi
+  # fallback
   hostname 2>/dev/null || echo "Home Assistant"
 }
 
@@ -78,7 +118,7 @@ echo "[cinexis] node_id: $NODE_ID"
 echo "[cinexis] ha_name: $HA_NAME"
 echo "[cinexis] HA upstream: ${HA_HOST}:${HA_PORT}"
 
-# Register node (store secret + ha_name on server)
+# register loop
 while true; do
   code="$(curl -sS -o /tmp/register.out -w '%{http_code}' \
     -H 'Content-Type: application/json' \
@@ -92,12 +132,12 @@ while true; do
   sleep 10
 done
 
-# Update name (best-effort)
+# best-effort name update
 curl -fsS -m 5 -H 'Content-Type: application/json' \
   -d "$(printf '{"node_id":"%s","ha_name":"%s"}' "$NODE_ID" "$HA_NAME")" \
   "$NAME_URL" >/dev/null 2>&1 || true
 
-# Wait for license assignment (admin binds a license to node_id)
+# wait for license bind
 while true; do
   hb_code="$(curl -sS -o /tmp/hb.out -w '%{http_code}' \
     -H 'Content-Type: application/json' \

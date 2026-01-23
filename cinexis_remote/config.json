@@ -6,12 +6,15 @@
   ],
   "boot": "auto",
   "description": "Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP)\n\nLicensing:\n- license_key: required (e.g. CINX-DEMO-0001)\n- frps_addr/frps_port: optional (defaults to VPS IP + 7000)\n- ha_subdomain_suffix: optional (default .ha.cinexis.cloud)\n",
-  "homeassistant_api": true,
   "ingress": false,
   "init": false,
+  "map": [
+    "share:rw",
+    "config:ro"
+  ],
   "name": "Cinexis Remote FRPC",
   "panel_icon": "mdi:cloud-lock",
   "slug": "cinexis_remote",
   "startup": "services",
-  "version": "0.2.20"
+  "version": "0.2.21"
 }
