@@ -16,5 +16,5 @@
   "panel_icon": "mdi:cloud-lock",
   "slug": "cinexis_remote",
   "startup": "services",
-  "version": "0.2.21"
+  "version": "0.2.22"
 }

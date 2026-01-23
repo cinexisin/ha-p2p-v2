@@ -1,0 +1,25 @@
+#include <tunables/global>
+
+profile cinexis_remote flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  file,
+  network,
+  capability,
+
+  /init ix,
+  /bin/** ix,
+  /usr/bin/** ix,
+  /usr/local/bin/** ix,
+
+  /run/** rwk,
+  /tmp/** rwk,
+  /data/** rw,
+  /share/** rw,
+  /config/** r,
+
+  /etc/** r,
+  /dev/** rw,
+  /proc/** r,
+  /sys/** r,
+}

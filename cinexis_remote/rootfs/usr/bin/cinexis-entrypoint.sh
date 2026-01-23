@@ -1,158 +1,144 @@
 #!/usr/bin/env sh
 set -eu
 
-API_BASE="${API_BASE:-https://api.cinexis.cloud}"
-FRPS_ADDR="${FRPS_ADDR:-139.99.56.240}"
-FRPS_PORT="${FRPS_PORT:-7000}"
-HA_SUBDOMAIN_SUFFIX="${HA_SUBDOMAIN_SUFFIX:-.ha.cinexis.cloud}"
+log(){ echo "[cinexis] $*"; }
 
-OIDC_TOKEN_URL="${API_BASE}/frp/oidc/token"
-REGISTER_URL="${API_BASE}/licensing/v1/nodes/register"
-NAME_URL="${API_BASE}/licensing/v1/nodes/name"
-HEARTBEAT_URL="${API_BASE}/licensing/v1/nodes/heartbeat"
+# Persist identity across updates & even uninstall/reinstall (prefer /share)
+PERSIST_BASE="/data"
+if [ -d /share ] && [ -w /share ]; then
+  PERSIST_BASE="/share"
+fi
+PERSIST_DIR="${PERSIST_BASE}/cinexis"
+mkdir -p "$PERSIST_DIR"
 
 DATA_DIR="/data"
-SHARE_DIR="/share/cinexis"
+mkdir -p "$DATA_DIR"
 
-NODE_ID_FILE_DATA="${DATA_DIR}/node_id"
-NODE_ID_FILE_SHARE="${SHARE_DIR}/node_id"
+NODE_ID_FILE="${PERSIST_DIR}/node_id"
+SECRET_FILE="${PERSIST_DIR}/device_secret"
+LOCKDIR="${PERSIST_DIR}/.lock"
 
-SECRET_FILE_DATA="${DATA_DIR}/device_secret"
-SECRET_FILE_SHARE="${SHARE_DIR}/device_secret"
-
-FRPC_TOML="${DATA_DIR}/frpc.toml"
-
-HA_HOST="${HA_HOST:-homeassistant}"
+FRPS_ADDR="${FRPS_ADDR:-139.99.56.240}"
+FRPS_PORT="${FRPS_PORT:-7000}"
 HA_PORT="${HA_PORT:-8123}"
+HA_SUBDOMAIN_SUFFIX="${HA_SUBDOMAIN_SUFFIX:-.ha.cinexis.cloud}"
 
-need() { command -v "$1" >/dev/null 2>&1 || { echo "[cinexis] ERROR: missing $1"; exit 1; }; }
-need curl
-need sed
-need tr
+API_BASE="${API_BASE:-https://api.cinexis.cloud}"
+OIDC_TOKEN_URL="${API_BASE}/frp/oidc/token"
+REGISTER_URL="${API_BASE}/licensing/v1/nodes/register"
+HEARTBEAT_URL="${API_BASE}/licensing/v1/nodes/heartbeat"
 
-mkdir -p "$DATA_DIR" || true
-if [ -d /share ]; then
-  mkdir -p "$SHARE_DIR" || true
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
+# ---- SINGLE INSTANCE LOCK ----
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  log "another instance already running; idling (prevents duplicate frpc/proxy)"
+  while true; do sleep 3600; done
 fi
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
 
-uuid_ok() {
-  echo "$1" | tr 'A-Z' 'a-z' | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-}
+sanitize_uuid(){ printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -d '\r\n '; }
+valid_uuid(){ printf '%s' "$1" | grep -Eq "$UUID_RE"; }
 
 gen_uuid() {
-  if [ -r /proc/sys/kernel/random/uuid ]; then
-    cat /proc/sys/kernel/random/uuid 2>/dev/null | tr 'A-Z' 'a-z'
-    return 0
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z'
+  else
+    h="$(cat /dev/urandom | tr -dc 'a-f0-9' | head -c 32)"
+    printf '%s\n' "$h" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
   fi
-  h="$(tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
-  echo "$h" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
 }
 
-atomic_write() {
-  f="$1"
-  v="$2"
-  tmp="${f}.tmp.$$"
-  printf "%s\n" "$v" > "$tmp"
-  mv -f "$tmp" "$f"
+get_ha_core_uuid() {
+  f="/config/.storage/core.uuid"
+  [ -f "$f" ] || return 1
+  v="$(sed -n 's/.*"uuid"[[:space:]]*:[[:space:]]*"\([a-fA-F0-9-]\{36\}\)".*/\1/p' "$f" | head -n1 || true)"
+  v="$(sanitize_uuid "$v")"
+  valid_uuid "$v" || return 1
+  printf '%s' "$v"
 }
-
-read_first() {
-  for f in "$@"; do
-    if [ -s "$f" ]; then
-      cat "$f" 2>/dev/null | tr -d '\r\n'
-      return 0
-    fi
-  done
-  return 1
-}
-
-# -------- node_id (prefer /share) --------
-NODE_ID="$(read_first "$NODE_ID_FILE_SHARE" "$NODE_ID_FILE_DATA" || true)"
-NODE_ID="$(echo "${NODE_ID:-}" | tr 'A-Z' 'a-z' | tr -d '\r\n')"
-
-if ! uuid_ok "$NODE_ID"; then
-  echo "[cinexis] node_id missing/corrupt -> generating new"
-  NODE_ID="$(gen_uuid)"
-  # write to share first (strongest persistence), then data
-  if [ -d "$SHARE_DIR" ]; then atomic_write "$NODE_ID_FILE_SHARE" "$NODE_ID"; fi
-  atomic_write "$NODE_ID_FILE_DATA" "$NODE_ID"
-else
-  # ensure both locations have it (copy forward)
-  if [ -d "$SHARE_DIR" ] && [ ! -s "$NODE_ID_FILE_SHARE" ]; then atomic_write "$NODE_ID_FILE_SHARE" "$NODE_ID"; fi
-  if [ ! -s "$NODE_ID_FILE_DATA" ]; then atomic_write "$NODE_ID_FILE_DATA" "$NODE_ID"; fi
-fi
-
-# -------- device_secret (prefer /share) --------
-DEVICE_SECRET="$(read_first "$SECRET_FILE_SHARE" "$SECRET_FILE_DATA" || true)"
-DEVICE_SECRET="$(echo "${DEVICE_SECRET:-}" | tr -d '\r\n')"
-
-if [ -z "${DEVICE_SECRET:-}" ]; then
-  echo "[cinexis] device_secret missing -> generating new"
-  DEVICE_SECRET="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48)"
-  if [ -d "$SHARE_DIR" ]; then atomic_write "$SECRET_FILE_SHARE" "$DEVICE_SECRET"; fi
-  atomic_write "$SECRET_FILE_DATA" "$DEVICE_SECRET"
-else
-  if [ -d "$SHARE_DIR" ] && [ ! -s "$SECRET_FILE_SHARE" ]; then atomic_write "$SECRET_FILE_SHARE" "$DEVICE_SECRET"; fi
-  if [ ! -s "$SECRET_FILE_DATA" ]; then atomic_write "$SECRET_FILE_DATA" "$DEVICE_SECRET"; fi
-fi
 
 get_ha_name() {
-  # No HA API perms needed: read HA's storage file (read-only)
-  if [ -r /config/.storage/core.config ]; then
-    n="$(tr -d '\n' </config/.storage/core.config \
-      | sed -n 's/.*"location_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-      | head -n1 || true)"
-    if [ -n "${n:-}" ]; then
-      echo "$n"
-      return
-    fi
-  fi
-  # fallback
-  hostname 2>/dev/null || echo "Home Assistant"
+  f="/config/.storage/core.config"
+  [ -f "$f" ] || { printf 'Home Assistant'; return 0; }
+  n="$(sed -n 's/.*"location_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1 || true)"
+  n="$(printf '%s' "$n" | tr -d '\r\n')"
+  [ -n "$n" ] && printf '%s' "$n" || printf 'Home Assistant'
 }
+
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+# ---- NODE ID ----
+NODE_ID=""
+if [ -f "$NODE_ID_FILE" ]; then
+  NODE_ID="$(sanitize_uuid "$(cat "$NODE_ID_FILE" 2>/dev/null || true)")"
+fi
+if [ -z "${NODE_ID:-}" ] || ! valid_uuid "$NODE_ID"; then
+  CORE_UUID="$(get_ha_core_uuid || true)"
+  if [ -n "${CORE_UUID:-}" ] && valid_uuid "$CORE_UUID"; then
+    NODE_ID="$CORE_UUID"
+  else
+    NODE_ID="$(gen_uuid)"
+  fi
+  printf '%s\n' "$NODE_ID" > "$NODE_ID_FILE"
+fi
+
+# ---- DEVICE SECRET ----
+if [ ! -f "$SECRET_FILE" ]; then
+  cat /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 48 > "$SECRET_FILE" || true
+fi
+DEVICE_SECRET="$(cat "$SECRET_FILE" 2>/dev/null | tr -d '\r\n' || true)"
+[ -n "$DEVICE_SECRET" ] || { log "ERROR: device_secret missing"; exit 1; }
 
 HA_NAME="$(get_ha_name)"
 
-echo "[cinexis] starting"
-echo "[cinexis] node_id: $NODE_ID"
-echo "[cinexis] ha_name: $HA_NAME"
-echo "[cinexis] HA upstream: ${HA_HOST}:${HA_PORT}"
+log "starting"
+log "node_id: $NODE_ID"
+log "ha_name: $HA_NAME"
+log "HA upstream: homeassistant:${HA_PORT}"
 
-# register loop
-while true; do
-  code="$(curl -sS -o /tmp/register.out -w '%{http_code}' \
-    -H 'Content-Type: application/json' \
-    -d "$(printf '{"node_id":"%s","device_secret":"%s","ha_name":"%s"}' "$NODE_ID" "$DEVICE_SECRET" "$HA_NAME")" \
-    "$REGISTER_URL" || true)"
-  if [ "$code" = "200" ]; then
-    echo "[cinexis] node register OK"
-    break
+# ---- REGISTER NODE (non-fatal, but keeps retrying) ----
+register_once() {
+  name_esc="$(json_escape "$HA_NAME")"
+  payload="{\"node_id\":\"$NODE_ID\",\"device_secret\":\"$DEVICE_SECRET\",\"ha_name\":\"$name_esc\"}"
+  code="$(curl -sS -o /tmp/reg.out -w '%{http_code}' -X POST "$REGISTER_URL" \
+    -H 'Content-Type: application/json' -d "$payload" || true)"
+  if [ "$code" = "200" ] || [ "$code" = "409" ]; then
+    log "node register OK"
+    return 0
   fi
-  echo "[cinexis] node register failed (http $code) -> $(head -c 200 /tmp/register.out 2>/dev/null || true)"
-  sleep 10
-done
+  body="$(head -c 240 /tmp/reg.out 2>/dev/null || true)"
+  log "node register failed (http $code) -> ${body:-"(no body)"}"
+  return 1
+}
 
-# best-effort name update
-curl -fsS -m 5 -H 'Content-Type: application/json' \
-  -d "$(printf '{"node_id":"%s","ha_name":"%s"}' "$NODE_ID" "$HA_NAME")" \
-  "$NAME_URL" >/dev/null 2>&1 || true
+# keep trying register in background loop, but don't block startup forever
+( i=0; while true; do
+    register_once && exit 0
+    i=$((i+1))
+    # backoff: 5s then 15s
+    [ "$i" -lt 3 ] && sleep 5 || sleep 15
+  done ) &
 
-# wait for license bind
+# ---- HEARTBEAT WAIT LOOP ----
+hb_payload="{\"node_id\":\"$NODE_ID\"}"
 while true; do
-  hb_code="$(curl -sS -o /tmp/hb.out -w '%{http_code}' \
-    -H 'Content-Type: application/json' \
-    -d "$(printf '{"node_id":"%s"}' "$NODE_ID")" \
-    "$HEARTBEAT_URL" || true)"
+  hb_code="$(curl -sS -o /tmp/hb.out -w '%{http_code}' -X POST "$HEARTBEAT_URL" \
+    -H 'Content-Type: application/json' -d "$hb_payload" || true)"
   if [ "$hb_code" = "200" ] && grep -q '"allowed":true' /tmp/hb.out; then
-    echo "[cinexis] license status: allowed ✅"
+    log "license status: allowed ✅"
     break
   fi
-  echo "[cinexis] not allowed yet (http $hb_code); retry in 15s"
+  log "not allowed yet (http $hb_code); retry in 15s"
   sleep 15
 done
 
 VHOST="${NODE_ID}${HA_SUBDOMAIN_SUFFIX}"
+log "public url: https://${VHOST}/"
 
+FRPC_TOML="${DATA_DIR}/frpc.toml"
 cat > "$FRPC_TOML" <<TOML
 serverAddr = "${FRPS_ADDR}"
 serverPort = ${FRPS_PORT}
@@ -166,10 +152,14 @@ auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 [[proxies]]
 name = "ha_ui"
 type = "http"
-localIP = "${HA_HOST}"
+localIP = "homeassistant"
 localPort = ${HA_PORT}
 customDomains = ["${VHOST}"]
 TOML
 
-echo "[cinexis] public url: https://${VHOST}/"
-exec /usr/local/bin/frpc -c "$FRPC_TOML"
+log "starting frpc (will restart on failure)"
+while true; do
+  /usr/local/bin/frpc -c "$FRPC_TOML" || true
+  log "frpc exited; retry in 10s"
+  sleep 10
+done
