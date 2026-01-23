@@ -1,3 +1,2 @@
-#!/usr/bin/with-contenv sh
-set -eu
+#!/usr/bin/with-contenv bash
 exec /usr/bin/cinexis-entrypoint.sh

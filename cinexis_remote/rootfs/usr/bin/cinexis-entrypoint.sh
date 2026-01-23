@@ -1,127 +1,148 @@
 #!/usr/bin/with-contenv bash
-set -Eeuo pipefail
+set -u
+set -o pipefail
 
 log(){ echo "[cinexis] $*"; }
 
-# ---- Defaults (no HA yaml edits required) ----
-FRPS_ADDR="${FRPS_ADDR:-139.99.56.240}"
-FRPS_PORT="${FRPS_PORT:-7000}"
-HA_SUBDOMAIN_SUFFIX="${HA_SUBDOMAIN_SUFFIX:-.ha.cinexis.cloud}"
-
-API_HOST="${API_HOST:-api.cinexis.cloud}"
-OIDC_TOKEN_URL="https://${API_HOST}/frp/oidc/token"
-REGISTER_URL="https://${API_HOST}/licensing/v1/nodes/register"
-HEARTBEAT_URL="https://${API_HOST}/licensing/v1/nodes/heartbeat"
-
-HA_HOST="${HA_HOST:-homeassistant}"
-HA_PORT="${HA_PORT:-8123}"
-
 DATA_DIR="/data"
-NODE_ID_FILE="${DATA_DIR}/node_id"
-SECRET_FILE="${DATA_DIR}/device_secret"
-FRPC_TOML="${DATA_DIR}/frpc.toml"
+NODE_ID_FILE="$DATA_DIR/node_id"
+SECRET_FILE="$DATA_DIR/device_secret"
+FRPC_TOML="$DATA_DIR/frpc.toml"
+
+API_BASE_DEFAULT="https://api.cinexis.cloud"
+FRPS_ADDR_DEFAULT="139.99.56.240"
+FRPS_PORT_DEFAULT="7000"
+HA_PORT_DEFAULT="8123"
+HA_SUFFIX_DEFAULT=".ha.cinexis.cloud"
 
 mkdir -p "$DATA_DIR"
 
-is_uuid() {
-  local x="${1,,}"
-  [[ "$x" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+# ---- single instance lock (prevents duplicate frpc/proxy) ----
+LOCKDIR="/tmp/cinexis.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  log "another Cinexis process already running; staying alive"
+  while true; do sleep 3600; done
+fi
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+
+# ---- minimal /data/options.json reader (no jq) ----
+opt_str() {
+  local key="$1" def="${2:-}"
+  if [ -f /data/options.json ]; then
+    local v
+    v="$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" /data/options.json | head -n 1 || true)"
+    if [ -n "${v:-}" ]; then echo "$v"; else echo "$def"; fi
+  else
+    echo "$def"
+  fi
 }
+opt_int() {
+  local key="$1" def="${2:-}"
+  if [ -f /data/options.json ]; then
+    local v
+    v="$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\\([0-9]\\+\\).*/\\1/p" /data/options.json | head -n 1 || true)"
+    if [ -n "${v:-}" ]; then echo "$v"; else echo "$def"; fi
+  else
+    echo "$def"
+  fi
+}
+opt_bool() {
+  local key="$1" def="${2:-false}"
+  if [ -f /data/options.json ]; then
+    local v
+    v="$(sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\\(true\\|false\\).*/\\1/p" /data/options.json | head -n 1 || true)"
+    if [ -n "${v:-}" ]; then echo "$v"; else echo "$def"; fi
+  else
+    echo "$def"
+  fi
+}
+
+API_BASE="$(opt_str api_base "$API_BASE_DEFAULT")"
+FRPS_ADDR="$(opt_str frps_addr "$FRPS_ADDR_DEFAULT")"
+FRPS_PORT="$(opt_int frps_port "$FRPS_PORT_DEFAULT")"
+HA_PORT="$(opt_int ha_port "$HA_PORT_DEFAULT")"
+HA_SUBDOMAIN_SUFFIX="$(opt_str ha_subdomain_suffix "$HA_SUFFIX_DEFAULT")"
+DEBUG_PRINT_SECRET="$(opt_bool debug_print_secret false)"
+
+OIDC_TOKEN_URL="${API_BASE}/frp/oidc/token"
+REGISTER_URL="${API_BASE}/licensing/v1/nodes/register"
+HEARTBEAT_URL="${API_BASE}/licensing/v1/nodes/heartbeat"
 
 gen_uuid() {
-  if [ -r /proc/sys/kernel/random/uuid ]; then
-    tr 'A-Z' 'a-z' < /proc/sys/kernel/random/uuid | tr -d '\r\n'
-  elif command -v uuidgen >/dev/null 2>&1; then
-    uuidgen | tr 'A-Z' 'a-z' | tr -d '\r\n'
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z'
   else
-    # very last fallback
     local h
-    h="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | tr 'A-F' 'a-f')"
-    echo "${h:0:8}-${h:8:4}-${h:12:4}-${h:16:4}-${h:20:12}"
+    h="$(tr -dc 'a-f0-9' </dev/urandom | head -c 32 || true)"
+    echo "${h}" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
   fi
 }
 
-gen_secret() {
-  # Avoid pipefail/SIGPIPE issues: temporarily disable pipefail for this pipeline
-  set +o pipefail
-  local s
-  s="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48)"
-  set -o pipefail
-  printf '%s' "$s"
-}
+if [ ! -s "$NODE_ID_FILE" ]; then
+  gen_uuid > "$NODE_ID_FILE"
+fi
+NODE_ID="$(tr -d '\r\n' < "$NODE_ID_FILE" | tr 'A-Z' 'a-z')"
 
-read_or_create_node_id() {
-  local nid=""
-  if [ -s "$NODE_ID_FILE" ]; then
-    nid="$(tr -d '\r\n' < "$NODE_ID_FILE" | tr 'A-Z' 'a-z')"
+if [ ! -s "$SECRET_FILE" ]; then
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 > "$SECRET_FILE" || true
+fi
+DEVICE_SECRET="$(tr -d '\r\n' < "$SECRET_FILE")"
+
+if [ "${DEBUG_PRINT_SECRET:-false}" = "true" ]; then
+  echo "=== DEBUG ==="
+  echo "node_id: $NODE_ID"
+  echo "device_secret: $DEVICE_SECRET"
+  echo "=== END DEBUG ==="
+  exit 0
+fi
+
+log "starting"
+log "node_id: $NODE_ID"
+
+# HA upstream detection (Supervisor DNS)
+HASS_HOST="homeassistant"
+check_upstream() { curl -fsS --max-time 2 "http://${1}:${HA_PORT}/" >/dev/null 2>&1; }
+
+if ! check_upstream "$HASS_HOST"; then
+  GW="$(ip route | awk '/default/ {print $3; exit}' || true)"
+  if [ -n "${GW:-}" ] && check_upstream "$GW"; then
+    HASS_HOST="$GW"
   fi
+fi
+log "HA upstream selected: ${HASS_HOST}:${HA_PORT}"
 
-  if ! is_uuid "$nid"; then
-    [ -n "$nid" ] && log "node_id file is invalid/corrupt -> regenerating"
-    nid="$(gen_uuid)"
-    echo "$nid" > "$NODE_ID_FILE"
-  fi
-
-  echo "$nid"
-}
-
-read_or_create_secret() {
-  local sec=""
-  if [ -s "$SECRET_FILE" ]; then
-    sec="$(tr -d '\r\n' < "$SECRET_FILE")"
-  fi
-
-  if [ -z "$sec" ]; then
-    sec="$(gen_secret)"
-    echo "$sec" > "$SECRET_FILE"
-  fi
-
-  echo "$sec"
-}
-
-register_node() {
+# register node (best-effort, continue on failure)
+register_once() {
   local payload code
   payload="$(printf '{"node_id":"%s","device_secret":"%s"}' "$NODE_ID" "$DEVICE_SECRET")"
-  code="$(curl -sS -o /tmp/cinexis_register.out -w '%{http_code}' \
-    -X POST "$REGISTER_URL" -H 'Content-Type: application/json' -d "$payload" || true)"
-
-  if [[ "$code" == "200" || "$code" == "409" ]]; then
+  code="$(curl -sS -o /tmp/register.out -w '%{http_code}' -X POST "$REGISTER_URL" -H 'Content-Type: application/json' -d "$payload" || true)"
+  if [ "$code" = "200" ] || [ "$code" = "409" ]; then
+    log "node register OK (http $code)"
     return 0
   fi
-
-  log "node register failed (http $code) -> $(head -c 140 /tmp/cinexis_register.out 2>/dev/null || true)"
+  log "node register failed (http $code) -> $(head -c 200 /tmp/register.out 2>/dev/null || true)"
   return 1
 }
+register_once || true
 
-wait_until_allowed() {
-  while true; do
-    local payload code
-    payload="$(printf '{"node_id":"%s"}' "$NODE_ID")"
-    code="$(curl -sS -o /tmp/cinexis_hb.out -w '%{http_code}' \
-      -X POST "$HEARTBEAT_URL" -H 'Content-Type: application/json' -d "$payload" || true)"
+# wait for license binding by server
+while true; do
+  hb_payload="$(printf '{"node_id":"%s"}' "$NODE_ID")"
+  hb_code="$(curl -sS -o /tmp/hb.out -w '%{http_code}' -X POST "$HEARTBEAT_URL" -H 'Content-Type: application/json' -d "$hb_payload" || true)"
+  if [ "$hb_code" = "200" ] && grep -q '"allowed":true' /tmp/hb.out; then
+    log "license status: allowed ✅"
+    break
+  fi
+  log "not allowed yet (http $hb_code); retry in 15s"
+  sleep 15
+done
 
-    if [[ "$code" == "200" ]] && grep -q '"allowed":true' /tmp/cinexis_hb.out 2>/dev/null; then
-      log "license status: allowed ✅"
-      return 0
-    fi
+log "public url: https://${NODE_ID}${HA_SUBDOMAIN_SUFFIX}/"
 
-    log "not allowed yet (http $code); retry in 15s"
-    sleep 15
-  done
-}
-
-wait_for_ha() {
-  while ! curl -fsS --max-time 2 "http://${HA_HOST}:${HA_PORT}/" >/dev/null 2>&1; do
-    log "waiting for Home Assistant at ${HA_HOST}:${HA_PORT} ..."
-    sleep 3
-  done
-}
-
-write_frpc() {
-  local vhost="${NODE_ID}${HA_SUBDOMAIN_SUFFIX}"
-  cat > "$FRPC_TOML" <<TOML
+cat > "$FRPC_TOML" <<TOML
 serverAddr = "${FRPS_ADDR}"
 serverPort = ${FRPS_PORT}
+loginFailExit = true
 
 auth.method = "oidc"
 auth.oidc.clientID = "${NODE_ID}"
@@ -132,37 +153,15 @@ auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 [[proxies]]
 name = "ha_ui"
 type = "http"
-localIP = "${HA_HOST}"
+localIP = "${HASS_HOST}"
 localPort = ${HA_PORT}
-customDomains = ["${vhost}"]
+customDomains = ["${NODE_ID}${HA_SUBDOMAIN_SUFFIX}"]
 TOML
 
-  log "public url: https://${vhost}/"
-}
-
-main() {
-  NODE_ID="$(read_or_create_node_id)"
-  DEVICE_SECRET="$(read_or_create_secret)"
-
-  log "starting"
-  log "node_id: ${NODE_ID}"
-  log "HA upstream selected: ${HA_HOST}:${HA_PORT}"
-
-  # keep trying forever
-  until register_node; do
-    sleep 15
-  done
-
-  wait_until_allowed
-  wait_for_ha
-  write_frpc
-
-  log "starting frpc (will restart on failure)"
-  while true; do
-    /usr/local/bin/frpc -c "$FRPC_TOML" || true
-    log "frpc exited; retry in 10s"
-    sleep 10
-  done
-}
-
-main "$@"
+while true; do
+  log "starting frpc (single instance)"
+  /usr/local/bin/frpc -c "$FRPC_TOML"
+  rc=$?
+  log "frpc exited rc=$rc; restarting in 5s"
+  sleep 5
+done
