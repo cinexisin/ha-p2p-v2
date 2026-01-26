@@ -1,6 +1,6 @@
 name: Cinexis Remote FRPC
 slug: cinexis_remote
-version: "0.2.24"
+version: "0.2.25"
 description: >
   Cinexis Remote Access: securely expose Home Assistant UI using Cinexis Cloud (FRP).
   No Home Assistant YAML changes required.

@@ -154,7 +154,7 @@ auth.oidc.audience = "frps"
 auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 
 [[proxies]]
-name = "ha_ui"
+name = "ha_ui_${NODE_ID}"
 type = "http"
 localIP = "homeassistant"
 localPort = 8123
