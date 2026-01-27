@@ -1,10 +1,14 @@
 {
   "name": "Cinexis Remote FRPC",
   "slug": "cinexis_remote",
-  "version": "0.2.29",
+  "version": "0.2.30",
   "description": "Cinexis Remote Access via Cinexis Cloud (FRP). No Home Assistant YAML changes required.",
   "url": "https://github.com/cinexisin/ha-p2p-v2",
-  "arch": ["amd64","aarch64","armv7"],
+  "arch": [
+    "amd64",
+    "aarch64",
+    "armv7"
+  ],
   "startup": "services",
   "boot": "auto",
   "init": false,
@@ -12,5 +16,8 @@
   "panel_icon": "mdi:cloud-lock",
   "options": {},
   "schema": {},
-  "map": ["share:rw","config:ro"]
+  "map": [
+    "share:rw",
+    "config:ro"
+  ]
 }

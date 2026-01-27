@@ -97,8 +97,12 @@ localIP = "homeassistant"
 localPort = 8123
 customDomains = ["$NODE_ID.ha.cinexis.cloud"]
 
+requestHeaders.set.x-forwarded-for = "127.0.0.1"
+requestHeaders.set.x-forwarded-proto = "http"
+requestHeaders.set.x-forwarded-host = "homeassistant"
+requestHeaders.set.forwarded = ""
 # Critical: avoid HA 400 by rewriting Host to local HA
-hostHeaderRewrite = "homeassistant:8123"
+hostHeaderRewrite = "homeassistant"
 TOML
 
 while true; do
