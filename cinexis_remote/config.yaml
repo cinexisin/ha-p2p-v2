@@ -1,5 +1,5 @@
 name: Cinexis Remote FRPC
-version: "0.2.26"
+version: "0.2.27"
 slug: cinexis_remote
 description: Secure remote access for Home Assistant via Cinexis Cloud.
 arch: [amd64, aarch64, armv7]
