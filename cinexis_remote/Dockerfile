@@ -4,7 +4,7 @@ FROM ${BUILD_FROM}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install tools needed to fetch frpc + parse JSON
-RUN apk add --no-cache curl tar ca-certificates jq
+RUN apk add --no-cache curl tar ca-certificates jq nginx
 
 WORKDIR /
 
