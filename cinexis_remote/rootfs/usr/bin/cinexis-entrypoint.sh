@@ -1,112 +1,201 @@
-#!/usr/bin/env bash
+#!/usr/bin/with-contenv bash
 set -euo pipefail
 
-API="https://api.cinexis.cloud"
-DATA_DIR="/share/cinexis"
-NODE_FILE="$DATA_DIR/node_id"
-SEC_FILE="$DATA_DIR/device_secret"
-LOCK_FILE="$DATA_DIR/run.pid"
+log(){ echo "[cinexis] $*"; }
 
-mkdir -p "$DATA_DIR"
+API_BASE="${CINEXIS_API_BASE:-https://api.cinexis.cloud}"
 
-# ---- stale-safe single instance lock ----
-if [ -f "$LOCK_FILE" ]; then
-  oldpid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
-  if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
-    echo "[cinexis] another instance already running; idling"
-    sleep infinity
-  fi
-  rm -f "$LOCK_FILE" || true
+REGISTER_URL="${API_BASE}/licensing/v1/nodes/register"
+HEARTBEAT_URL="${API_BASE}/licensing/v1/nodes/heartbeat"
+OIDC_TOKEN_URL="${API_BASE}/frp/oidc/token"
+
+FRPS_ADDR="${FRPS_ADDR:-139.99.56.240}"
+FRPS_PORT="${FRPS_PORT:-7000}"
+HA_SUFFIX="${HA_SUBDOMAIN_SUFFIX:-.ha.cinexis.cloud}"
+
+HA_UPSTREAM_HOST="homeassistant"
+HA_UPSTREAM_PORT="8123"
+
+DATA_DIR="/data"
+SHARE_DIR="/share/cinexis_remote"
+mkdir -p "$DATA_DIR" || true
+
+# Prefer /share for persistence
+if mkdir -p "$SHARE_DIR" 2>/dev/null && [ -w "$SHARE_DIR" ]; then
+  :
+else
+  SHARE_DIR="$DATA_DIR"
 fi
-echo $$ > "$LOCK_FILE"
-trap 'rm -f "$LOCK_FILE" >/dev/null 2>&1 || true' EXIT
+
+NODE_ID_FILE="$SHARE_DIR/node_id"
+SECRET_FILE="$SHARE_DIR/device_secret"
+
+LOCK_DIR="$SHARE_DIR/lock"
+LOCK_PID="$LOCK_DIR/pid"
+
+is_uuid() { echo "$1" | grep -Eqi '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; }
 
 gen_uuid() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    uuidgen | tr 'A-Z' 'a-z'
-    return
-  fi
-  h="$(tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
+  if [ -r /proc/sys/kernel/random/uuid ]; then tr 'A-Z' 'a-z' </proc/sys/kernel/random/uuid; return; fi
+  h="$(tr -dc 'a-f0-9' </dev/urandom | head -c 32 || true)"
   echo "$h" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/'
 }
 gen_secret() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48; }
 
-[ -f "$NODE_FILE" ] || gen_uuid > "$NODE_FILE"
-[ -f "$SEC_FILE" ]  || gen_secret > "$SEC_FILE"
+atomic_write() { tmp="$(mktemp "$1.tmp.XXXXXX")"; printf '%s\n' "$2" >"$tmp"; mv -f "$tmp" "$1"; }
 
-NODE_ID="$(tr -d '\r\n' <"$NODE_FILE")"
-DEVICE_SECRET="$(tr -d '\r\n' <"$SEC_FILE")"
-
-# HA “Name” from /config/.storage/core.config (no jq dependency)
-HA_NAME="Home Assistant"
-if [ -f /config/.storage/core.config ]; then
-  n="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /config/.storage/core.config | head -n1 || true)"
-  [ -n "${n:-}" ] && HA_NAME="$n"
-fi
-
-echo "[cinexis] node_id: $NODE_ID"
-echo "[cinexis] ha_name: $HA_NAME"
-echo "[cinexis] HA upstream: homeassistant:8123"
-
-# Register node+secret (idempotent)
-while true; do
-  code="$(curl -sS -o /tmp/cinx_reg.out -w '%{http_code}' \
-    -X POST "$API/licensing/v1/nodes/register" \
-    -H "Content-Type: application/json" \
-    -d "{\"node_id\":\"$NODE_ID\",\"device_secret\":\"$DEVICE_SECRET\",\"ha_name\":\"$HA_NAME\"}" \
-    || echo 000)"
-  if [ "$code" = "200" ]; then
-    echo "[cinexis] node register OK"
-    break
+ensure_node_id() {
+  v=""
+  [ -s "$NODE_ID_FILE" ] && v="$(tr -d '\r\n' <"$NODE_ID_FILE" | tr 'A-Z' 'a-z')"
+  if ! is_uuid "$v"; then
+    v="$(gen_uuid)"
+    is_uuid "$v" || { sleep 1; v="$(gen_uuid)"; }
+    is_uuid "$v" || { log "FATAL: could not generate valid node_id"; exit 1; }
+    atomic_write "$NODE_ID_FILE" "$v"
   fi
-  echo "[cinexis] node register failed (http $code); retry in 10s"
-  sleep 10
-done
+  echo "$v"
+}
 
-# Wait until allowed (admin binds license to node_id)
-while true; do
-  hb_code="$(curl -sS -o /tmp/cinx_hb.out -w '%{http_code}' \
-    -X POST "$API/licensing/v1/nodes/heartbeat" \
-    -H "Content-Type: application/json" \
-    -d "{\"node_id\":\"$NODE_ID\"}" \
-    || echo 000)"
-  if [ "$hb_code" = "200" ] && grep -q '"allowed":true' /tmp/cinx_hb.out 2>/dev/null; then
-    echo "[cinexis] license status: allowed ✅"
-    break
+ensure_secret() {
+  v=""
+  [ -s "$SECRET_FILE" ] && v="$(tr -d '\r\n' <"$SECRET_FILE")"
+  if [ "${#v}" -lt 32 ]; then
+    v="$(gen_secret)"
+    [ "${#v}" -ge 32 ] || { log "FATAL: could not generate device_secret"; exit 1; }
+    atomic_write "$SECRET_FILE" "$v"
   fi
-  echo "[cinexis] not allowed yet (http $hb_code); retry in 15s"
-  sleep 15
-done
+  echo "$v"
+}
 
-echo "[cinexis] public url: https://$NODE_ID.ha.cinexis.cloud/"
+acquire_lock() {
+  while true; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo $$ >"$LOCK_PID"
+      trap 'rm -rf "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
+      return
+    fi
+    oldpid="$(cat "$LOCK_PID" 2>/dev/null || true)"
+    if [ -n "${oldpid:-}" ] && kill -0 "$oldpid" 2>/dev/null; then
+      log "another instance already running; idling"
+      while kill -0 "$oldpid" 2>/dev/null; do sleep 20; done
+      continue
+    fi
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    sleep 1
+  done
+}
 
-cat > /data/frpc.toml <<TOML
-serverAddr = "api.cinexis.cloud"
-serverPort = 7000
+get_ha_name() {
+  f="/config/.storage/core.config"
+  if [ -r "$f" ]; then
+    name="$(grep -oE '"location_name"\s*:\s*"[^"]+"' "$f" 2>/dev/null | head -n1 | sed -E 's/.*"location_name"\s*:\s*"([^"]+)".*/\1/' || true)"
+    [ -n "${name:-}" ] && { echo "$name"; return; }
+  fi
+  echo "Home Assistant"
+}
+
+register_node_loop() {
+  node_id="$1"; secret="$2"; ha_name="$3"
+  payload="$(printf '{"node_id":"%s","device_secret":"%s","ha_name":"%s"}' "$node_id" "$secret" "$(echo "$ha_name" | sed 's/"/\\"/g')")"
+  while true; do
+    code="$(curl -sS -o /tmp/cinx_reg.out -w '%{http_code}' -X POST "$REGISTER_URL" -H 'Content-Type: application/json' -d "$payload" || echo 000)"
+    if [ "$code" = "200" ] || [ "$code" = "409" ]; then
+      log "node register OK"
+      return
+    fi
+    log "node register failed (http $code); retry in 10s"
+    sleep 10
+  done
+}
+
+wait_allowed() {
+  node_id="$1"
+  while true; do
+    code="$(curl -sS -o /tmp/cinx_hb.out -w '%{http_code}' -X POST "$HEARTBEAT_URL" -H 'Content-Type: application/json' -d "{\"node_id\":\"$node_id\"}" || echo 000)"
+    if [ "$code" = "200" ] && grep -q '"allowed"[[:space:]]*:[[:space:]]*true' /tmp/cinx_hb.out 2>/dev/null; then
+      log "license status: allowed ✅"
+      return
+    fi
+    log "not allowed yet; retry in 15s"
+    sleep 15
+  done
+}
+
+pick_host_rewrite() {
+  # Try to find a Host header HA accepts (prevents aiohttp 400)
+  ha_ip="$(getent hosts "$HA_UPSTREAM_HOST" 2>/dev/null | awk '{print $1; exit}' || true)"
+  candidates=()
+  [ -n "${ha_ip:-}" ] && candidates+=("${ha_ip}:${HA_UPSTREAM_PORT}")
+  candidates+=("127.0.0.1:${HA_UPSTREAM_PORT}" "localhost:${HA_UPSTREAM_PORT}" "${HA_UPSTREAM_HOST}:${HA_UPSTREAM_PORT}")
+
+  for h in "${candidates[@]}"; do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 -H "Host: $h" "http://${HA_UPSTREAM_HOST}:${HA_UPSTREAM_PORT}/" || echo 000)"
+    case "$code" in
+      2*|3*)
+        echo "$h"
+        return
+        ;;
+    esac
+  done
+
+  # fallback
+  echo "${HA_UPSTREAM_HOST}:${HA_UPSTREAM_PORT}"
+}
+
+main() {
+  acquire_lock
+
+  NODE_ID="$(ensure_node_id)"
+  DEVICE_SECRET="$(ensure_secret)"
+  HA_NAME="$(get_ha_name)"
+
+  log "node_id: $NODE_ID"
+  log "ha_name: $HA_NAME"
+  log "HA upstream: ${HA_UPSTREAM_HOST}:${HA_UPSTREAM_PORT}"
+
+  register_node_loop "$NODE_ID" "$DEVICE_SECRET" "$HA_NAME"
+  wait_allowed "$NODE_ID"
+
+  HOST_REWRITE="$(pick_host_rewrite)"
+  log "hostHeaderRewrite: $HOST_REWRITE"
+
+  VHOST="${NODE_ID}${HA_SUFFIX}"
+  PROXY_NAME="ha_ui_${NODE_ID}"
+
+  cat > /data/frpc.toml <<TOML
+serverAddr = "${FRPS_ADDR}"
+serverPort = ${FRPS_PORT}
 
 auth.method = "oidc"
-auth.oidc.clientID = "$NODE_ID"
-auth.oidc.clientSecret = "$DEVICE_SECRET"
+auth.oidc.clientID = "${NODE_ID}"
+auth.oidc.clientSecret = "${DEVICE_SECRET}"
 auth.oidc.audience = "frps"
-auth.oidc.tokenEndpointURL = "$API/frp/oidc/token"
+auth.oidc.tokenEndpointURL = "${OIDC_TOKEN_URL}"
 
 [[proxies]]
-name = "ha_ui_${NODE_ID}"
+name = "${PROXY_NAME}"
 type = "http"
-localIP = "homeassistant"
-localPort = 8123
-customDomains = ["$NODE_ID.ha.cinexis.cloud"]
+localIP = "${HA_UPSTREAM_HOST}"
+localPort = ${HA_UPSTREAM_PORT}
+customDomains = ["${VHOST}"]
 
+# rewrite Host to something HA accepts (auto-detected)
+hostHeaderRewrite = "${HOST_REWRITE}"
+
+# force single forwarded values (avoid aiohttp 400 on duplicates)
 requestHeaders.set.x-forwarded-for = "127.0.0.1"
-requestHeaders.set.x-forwarded-proto = "http"
-requestHeaders.set.x-forwarded-host = "homeassistant"
-requestHeaders.set.forwarded = ""
-# Critical: avoid HA 400 by rewriting Host to local HA
-hostHeaderRewrite = "homeassistant"
+requestHeaders.set.x-real-ip = "127.0.0.1"
+requestHeaders.set.x-forwarded-proto = "https"
+requestHeaders.set.x-forwarded-host = "${HOST_REWRITE}"
 TOML
 
-while true; do
-  echo "[cinexis] starting frpc"
-  frpc -c /data/frpc.toml || true
-  sleep 5
-done
+  log "public url: https://${VHOST}/"
+
+  while true; do
+    log "starting frpc"
+    /usr/local/bin/frpc -c /data/frpc.toml || true
+    sleep 5
+  done
+}
+
+main "$@"
